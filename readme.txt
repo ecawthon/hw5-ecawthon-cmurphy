@@ -11,3 +11,6 @@ If a more verbose output is desired, the code
 contains a debug print function of varying verbosities, which we found useful
 while tracking the progress of our processes. 
 
+We have run the following tests:
+M=2, 3 nodes:
+    join 1, 2, 3, store keys, kill in any order, all data is preserved
