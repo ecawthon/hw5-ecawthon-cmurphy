@@ -49,6 +49,7 @@ node_join(M, OtherNodes) ->
             % we're first--tell storage processes to go straight to serve
             node_spawn_and_register_processes(storage_serve,
                 lists:seq(0, round(math:pow(2, M)) - 1), M),
+            print("(node_join) Entering (node_monitor)~n"),
             node_monitor(0, 0, M);
         [OtherNode] ->
             net_kernel:connect(list_to_atom(OtherNode)),
@@ -71,8 +72,7 @@ node_join(M, OtherNodes) ->
                     % until we have all maps
                     Node = node(global:whereis_name(SuccName)), 
                     monitor_node(Node, true),
-                    debug(3, 
-                        "(node_join) Entering node_monitor(~p, ~p, ~p)~n", 
+                    print("(node_join) Entering node_monitor(~p, ~p, ~p)~n", 
                         [MyNum, SuccNum, M]),
                     node_monitor(MyNum, SuccNum, M)
             end
@@ -168,36 +168,30 @@ node_rebalance(MyNum, DepartedNum, M) ->
     NewRange = node_get_responsibilities(DepartedNum, NewSuccessor, 
         NumProcesses),
     OldRange = node_get_responsibilities(MyNum, DepartedNum, NumProcesses),
-    % ^ this should not return until nodes and backups are initialized
     case node_can_take_all_processes(NewRange ++ OldRange, NumProcesses) of
         true ->
             node_take_responsibility(MyNum, NewRange, M), 
+            print("(node_rebalance) Entering (node_monitor)~n"),
             node_monitor(MyNum, NewSuccessor, M);
         false ->
             MyNewNum = get_legal_num(lists:last(NewRange), 
                 (NumProcesses / 2) + 1, NumProcesses),
             MyBackupNums = node_get_my_backup_proc_nums(),
-            debug(3, "(node_rebalance) MyBackupNums:~p NewRange:~p~n",
-                [MyBackupNums, NewRange]),
-            BackupsToSwitch = lists:filter(
+            {BackupsToSwitch, ToRequest} = lists:partition(
                 fun(X) -> lists:any(fun(Y) -> Y == X end, MyBackupNums) end,
                 NewRange),
             PrimariesToSwitch = lists:map(fun(X) -> 
                         backup_get_num(storage_assoc_backup_name(X, M)) end,
                 BackupsToSwitch),
-            ToRequest = lists:filter(
-                fun(X) -> not lists:any(
-                            fun(Y) ->
-                                    Y == X
-                            end,
-                            MyBackupNums) end,
-                NewRange),
+            debug(2, "(node_rebalance) MyBackupNums:~p NewRange:~p"++
+                "BackupsToSwitch:~p, ToReauest:~p~n",
+                [MyBackupNums, NewRange, BackupsToSwitch, ToRequest]),
             node_switch_processes(PrimariesToSwitch, M),
             debug(2, "(node_rebalance) Switched: ~p. My procs: ~p~n",
                 [PrimariesToSwitch, node_get_my_processes()]),
-            Recipient = node_get_predecessor(MyNum),
             glocally_unregister_name(node_name(MyNum)),
             glocally_register_name(node_name(MyNewNum), self()),
+            Recipient = node_get_predecessor(MyNum),
             debug(1,"(node_rebalance) Re-registered as ~p~n",
                 [node_name(MyNewNum)]),
             node_send_to_node_proc(MyNewNum, Recipient, {take_processes, 
@@ -209,6 +203,7 @@ node_rebalance(MyNum, DepartedNum, M) ->
             node_take_responsibility(MyNewNum, ToRequest, M),
             debug(2, "(node_rebalance) Took ~p. MyProcs: ~p~n",
                 [ToRequest, node_get_my_processes()]),
+            print("(node_rebalance) Entering (node_monitor)~n"),
             node_monitor(MyNewNum, NewSuccessor, M)
     end.
 
@@ -296,7 +291,7 @@ storage_await_maps(MyNum, Map, BackupMap, M) ->
 %% Neighbors: a list of the process numbers of this process' chord neighbors.
 %% M: Where there are 2^M storage processes.
 storage_serve(Neighbors, M) ->
-    debug(1, "(storage_serve) Entered storage_serve.~n"),
+    print("(storage_serve) Entered storage_serve.~n"),
     storage_serve([], Neighbors, M).
 storage_serve(Map, Neighbors, M) ->
     MyNum = get_legal_num(hd(Neighbors), -1, 
@@ -501,6 +496,7 @@ backup(MyNum, Map, M) ->
             SwitcherPid ! {switched, MyNum},
             print("(backup) Sent {switched, ~p} to ~p~n", 
                 [MyNum, SwitcherPid]),
+            print("(backup) Entering (storage_serve)~n"),
             storage_serve(Map, storage_get_neighbors(MyNum, M), M);
         Message ->
             print("(backup) Got unexpected Message: ~p~n",[Message]),
@@ -594,6 +590,7 @@ node_handle_join(Pid, MyNum, MySuccNum, M, ItsPredNum, ItsNum, ItsSuccNum) ->
             NewNode = node(Pid),
             monitor_node(OldNode, false),
             monitor_node(NewNode, true),
+            print("(node_handle_join) Entering (node_monitor)~n"),
             node_monitor(MyNum, ItsNum, M)
             ;
         _ ->
@@ -608,6 +605,7 @@ node_handle_join(Pid, MyNum, MySuccNum, M, ItsPredNum, ItsNum, ItsSuccNum) ->
                 print("(node_handle_join) Sent {~p, ~p, ~p,} to ~p~n",
                     [join_request, ItsPredNum, ItsNum, 
                         ItsSuccNum, ForwardingNode]),
+                print("(node_handle_join) Entering (node_monitor)~n"),
                 node_monitor(MyNum, MySuccNum, M)
     end.
 
@@ -698,8 +696,8 @@ node_take_responsibility(MyNum, Range, M) ->
     %% should be all because we should never tell it to take responsibility 
     %% for something it already has.
     node_spawn_and_register_processes(storage_join, Range, M),
-    debug(1, "(take_responsibility) Node~p is waiting for children~n",
-        [MyNum]),
+    debug(1, "(take_responsibility) Node~p is waiting for children ~p~n",
+        [MyNum, Range]),
     node_wait_for_prodigal_children(Range).
 
 
@@ -778,10 +776,11 @@ storage_get_neighbors(MyNum, M)->
 %% all?
 node_can_take_all_processes(NumRange, NumProcesses) ->
     TooMany = (length(NumRange) > (NumProcesses / 2)) ,
-    Alone = node_is_alone(hd(NumRange)),
-    Result = not (TooMany or Alone),
-    debug(1, "(can_take_all) Range: ~p. TooMany: ~p. Alone: ~p. Result: ~p.~n",
-        [NumRange, TooMany, Alone, Result]),
+    Alone = length(all_node_procs()) == 1,
+    Result = (not TooMany) or Alone,
+    debug(1, "(can_take_all) Range: ~p. TooMany: ~p. Alone: ~p. "++
+        "Result: ~p. Globally registered:~n\t~p~n",
+        [NumRange, TooMany, Alone, Result, global:registered_names()]),
     Result.
 
 node_switch_processes(Range, M) ->
@@ -892,6 +891,9 @@ get_legal_num(Start, Offset, NumProcesses)->
         [Start, Offset, NumProcesses, Ret]),
     Ret.
 
+all_node_procs() ->
+    lists:filter(fun(X) -> is_node(X) end, global:registered_names()).
+
 %% Given a process number, get the name of the node process it's supposed to be 
 %% on
 storage_get_expected_node_name_of(MyNum) ->
@@ -938,16 +940,6 @@ is_storage(Atom) ->
 is_backup(Atom) ->
     debug(4,"is it a backup process? ~p~n", [Atom]),
     [hd(atom_to_list(Atom))] == "B".
-
-
-node_is_alone(MyNum) ->
-    debug(3,"Entering node_is_alone(~p)~n", [MyNum]),
-    MyName = node_name(MyNum),
-    debug(3,"(node_is_alone) My Name: ~p~n",[MyName]),
-    NodeList = lists:filter(fun(X) -> is_node(X) end, 
-        global:registered_names()),
-    NodeNames = lists:delete(MyName, NodeList),
-    NodeNames == [].
 
 %% Forward "snapshot" infor requests around ring & aggregate 
 %% information
