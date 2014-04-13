@@ -10,7 +10,7 @@
 %% ==========================================================================
 -export([main/1, node_monitor/3, storage_join/2, backup/3, is_node/1, 
         storage_serve/2, storage_serve/3]).
--define(DEBUG, 0).
+-define(DEBUG, 2).
 
 main(Params) ->
     try
@@ -547,7 +547,7 @@ node_send_to_node_proc(Sender, RecipientNum, Message, M) ->
 storage_get_forwarding_neighbor(RecipientNum, Neighbors)->
     debug(3,"Entering storage_get_forwarding_neighbor(~p, ~p)~n",
         [RecipientNum, Neighbors]),
-    case lists:any(fun(Y) -> Y == RecipientNum end, Neighbors) of
+    Neighbor = case lists:any(fun(Y) -> Y == RecipientNum end, Neighbors) of
         true ->
             RecipientNum; % If we can send directly to RecipientNum...
         false ->
@@ -557,7 +557,10 @@ storage_get_forwarding_neighbor(RecipientNum, Neighbors)->
                 [] -> lists:last(Neighbors);
                 _-> hd(Lower)
             end
-        end.
+        end,
+    debug(2, "(get_forward) Recipient:~p Neighbors: ~p, Neighbor:~p~n",
+        [RecipientNum, Neighbors, Neighbor]),
+    Neighbor.
 
 %% Joining-Related Functions
 %% ---------------------------------------------------------------------------
@@ -594,19 +597,15 @@ node_handle_join(Pid, MyNum, MySuccNum, M, ItsPredNum, ItsNum, ItsSuccNum) ->
             node_monitor(MyNum, ItsNum, M)
             ;
         _ ->
-                debug(2, "(node_handle_join) ItsPredNum: ~p, MyNum: ~p~n",
-                    [ItsPredNum, MyNum]),
-                ForwardingNode = 
-                node_name(storage_get_forwarding_neighbor(
-                        ItsPredNum, storage_get_neighbors(
-                            ItsPredNum,M))),
-                ForwardingNode ! 
-                    {join_request, Pid, ItsPredNum, ItsNum, ItsSuccNum},
-                print("(node_handle_join) Sent {~p, ~p, ~p,} to ~p~n",
-                    [join_request, ItsPredNum, ItsNum, 
-                        ItsSuccNum, ForwardingNode]),
-                print("(node_handle_join) Entering (node_monitor)~n"),
-                node_monitor(MyNum, MySuccNum, M)
+            debug(2, "(node_handle_join) ItsPredNum: ~p, MyNum: ~p~n",
+                [ItsPredNum, MyNum]),
+            node_send_to_node_proc(MyNum, ItsPredNum,
+                {join_request, Pid, ItsPredNum, ItsNum, ItsSuccNum}, M),
+            print(
+                "(node_handle_join) Sent {join_request, ~p, ~p, ~p, ~p} to ~p~n",
+                [Pid, ItsPredNum, ItsNum, ItsSuccNum, ItsPredNum]),
+            print("(node_handle_join) Entering (node_monitor)~n"),
+            node_monitor(MyNum, MySuccNum, M)
     end.
 
 %% Find the biggest split between node names.
@@ -765,9 +764,9 @@ node_pick_num(NumProcesses)->
 %% Returns a list of the numbers of a node's neighbors.
 storage_get_neighbors(MyNum, M)->
     NumProcesses = round(math:pow(2, M)),
-    lists:map(
+    [MyNum | lists:map(
         fun(X) -> get_legal_num(MyNum, round(math:pow(2, X)), NumProcesses) end,
-        lists:seq(0, M-1)).
+        lists:seq(0, M-1))].
 %%
 %% Rebalancing-Related Functions
 %% ---------------------------------------------------------------------------
