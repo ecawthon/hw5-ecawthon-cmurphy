@@ -16,3 +16,5 @@ M=2, 3 nodes:
     join 1, 2, 3, store keys, kill in any order, all data is preserved
 M=2, 4 nodes:
     join 1, 2, 3, 4 works and distributes processes correctly
+M=3, 3-4 nodes:
+    Everything tested works consistently

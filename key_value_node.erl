@@ -10,7 +10,7 @@
 %% ==========================================================================
 -export([main/1, node_monitor/3, storage_join/2, backup/3, is_node/1, 
         storage_serve/2, storage_serve/3]).
--define(DEBUG, 2).
+-define(DEBUG, 0).
 
 main(Params) ->
     try
@@ -44,11 +44,10 @@ node_join(M, OtherNodes) ->
     print("(node_join) Entered node_join(~p, ~p)~n", [M, OtherNodes]),
     case OtherNodes of
         [] ->
-            debug(1, "(node_join) OtherNode was empty~n"),
             glocally_register_name('Node0', self()),
             % we're first--tell storage processes to go straight to serve
             node_spawn_and_register_processes(storage_serve,
-                lists:seq(0, round(math:pow(2, M)) - 1), M),
+                lists:seq(0, trunc(math:pow(2, M)) - 1), M),
             print("(node_join) Entering (node_monitor)~n"),
             node_monitor(0, 0, M);
         [OtherNode] ->
@@ -56,14 +55,13 @@ node_join(M, OtherNodes) ->
             global:sync(),
             Registered = global:registered_names(),
             NodeNames = lists:filter(fun(X) -> is_node(X) end, Registered),
-            global:send(hd(NodeNames), {join_request, self()}), 
-            print("(node_join) Sent {~p, ~p} to ~p~n", [join_request, self(), 
-                    hd(NodeNames)]),
+            global_send(hd(NodeNames), {join_request, self()}), 
             receive
                 {join_ack, MyNum, SuccNum, Range} ->
                     print("(node_join) got {~p, ~p, ~p, ~p}~n",
                         [join_ack, MyNum, SuccNum, Range]),
                     glocally_register_name(node_name(MyNum), self()), 
+                    global:sync(),
                     SuccName = node_name(SuccNum),
                     debug(3, "(node_join) taking responsibility~n"),
                     % not first--take responsibility for some existing 
@@ -83,7 +81,7 @@ node_join(M, OtherNodes) ->
 %% SuccNum: My successor's number
 %% NumProcesses: Total processes in the system
 node_monitor(MyNum, SuccNum, M) ->
-    NumProcesses = round(math:pow(2,M)),
+    NumProcesses = trunc(math:pow(2,M)),
     debug(1, "(node_monitor) Entered node_monitor.~n" ++
         "\tMy processes:~p~n"++
         "\tGlobal names:~p~n", 
@@ -138,18 +136,13 @@ node_monitor(MyNum, SuccNum, M) ->
                         [Ref, result, NodeList, Pid]);
                 false ->
                     Message = {Pid, Ref, node_list, [MyName|NodeList]},
-                    global:send(SuccName, Message),
-                    print("Sent {~p, ~p, ~p, ~p} to ~p~n",
-                        [Pid, Ref, node_list, [MyName|NodeList],
-                            SuccName])
+                    global_send(SuccName, Message)
             end,
             node_monitor(MyNum, SuccNum, M);
-        {registered, Recipient, Sender} -> 
-	 	    node_send_to_node_proc(MyNum, Recipient, 
-                {registered, Recipient, Sender}, M);
         Message -> 
-            debug(1,"Unexcpected message received in node_monitor: ~p~n",
-                [Message])
+            print("Unexpected message received in node_monitor: ~p~n",
+                [Message]),
+            node_monitor(MyNum, SuccName, M)
     end.
 
 %% The node process's rebalancing state: After a node dies
@@ -159,7 +152,7 @@ node_monitor(MyNum, SuccNum, M) ->
 node_rebalance(MyNum, DepartedNum, M) ->
     print("(node_rebalance) Entered node_rebalance(~p, ~p, ~p)~n",
         [MyNum, DepartedNum, M]),
-    NumProcesses = round(math:pow(2,M)),
+    NumProcesses = trunc(math:pow(2,M)),
     global:sync(),
     NewSuccessor = node_get_num(node_get_successor(DepartedNum)),
     %% Monitor our NewSucessor now.
@@ -194,18 +187,34 @@ node_rebalance(MyNum, DepartedNum, M) ->
             Recipient = node_get_predecessor(MyNum),
             debug(1,"(node_rebalance) Re-registered as ~p~n",
                 [node_name(MyNewNum)]),
-            node_send_to_node_proc(MyNewNum, Recipient, {take_processes, 
+            node_send_to_node_proc(MyNewNum, node_get_num(Recipient),
+                {take_processes, 
                     node_get_num(Recipient), PrimariesToSwitch}, M),
-            receive
-                {monitoring} ->
-                    print("(node_rebalance) Got {monitoring}~n")
-            end,
+            node_wait_for_monitoring(MyNewNum, M),
             node_take_responsibility(MyNewNum, ToRequest, M),
             debug(2, "(node_rebalance) Took ~p. MyProcs: ~p~n",
                 [ToRequest, node_get_my_processes()]),
             print("(node_rebalance) Entering (node_monitor)~n"),
             node_monitor(MyNewNum, NewSuccessor, M)
     end.
+
+node_wait_for_monitoring(MyNum, M) ->
+    receive
+        {monitoring} ->
+            print("(node_rebalance) Got {monitoring}~n");
+        {take_processes, RecipientNum, Range} ->
+            print("(node_rebalance) Got {~p, ~p, ~p}~n",
+                [take_processes, RecipientNum, Range]),
+            case RecipientNum of
+                MyNum ->
+                    ok;
+                _ ->
+                    node_send_to_node_proc(MyNum, RecipientNum, 
+                        {take_processes, RecipientNum, Range}, M)
+            end,
+            node_wait_for_monitoring(MyNum, M)
+    end.
+
 
 node_leave() ->
     print("(node_leave) Entered node_leave()~n"),
@@ -230,10 +239,8 @@ storage_join(MyNum, M) ->
             global:registered_names()]),
     print("(storage_join) sending {~p, request_map} to ~p~n", 
         [self(), BackupToConsult]),
-    global:send(BackupToConsult, {self(), request_map}),
-    print("(storage_join) sending {~p, request_backup} to ~p~n", 
-        [self(), StorageToConsult]),
-    global:send(StorageToConsult, {self(), request_backup}),
+    global_send(BackupToConsult, {self(), request_map}),
+    global_send(StorageToConsult, {self(), request_backup}),
     storage_await_maps(MyNum, none, none, M).
 
 %% Waits until both maps needed by a new process arrive, then switches to
@@ -249,22 +256,17 @@ storage_await_maps(MyNum, Map, BackupMap, M) ->
     receive
         {map, NewMap} ->
             %% I came from your backup process
-            print("(storage_await_maps) got {~p, ~p}~n",
-                [map, NewMap]),
+            print("(storage_await_maps) got {map, ~p}~n", [NewMap]),
             case BackupMap of
                 none ->
                     storage_await_maps(MyNum, NewMap, BackupMap, M);
                 _ ->
                     NodeName = storage_get_expected_node_name_of(MyNum),
-                    global:send(NodeName, {serving, MyNum}),
-                    print("Sent {serving, ~p} to ~p~n",[MyNum, NodeName]),
-                    print("(await_maps) Entering storage_serve(~p, ~p)~n",
-                        [NewMap, storage_get_neighbors(MyNum, M)]),
-                    storage_serve(NewMap, storage_get_neighbors(MyNum, M), M)
+                    global_send(NodeName, {serving, MyNum}),
+                    storage_serve(NewMap, MyNum, M)
             end;
         {backup, NewBackupMap} ->
-            print("(storage_await_maps) got {~p, ~p}~n",
-                [backup, NewBackupMap]),
+            print("(storage_await_maps) got {~p, ~p}~n", [backup, NewBackupMap]),
             BackupName = storage_assoc_backup_name(MyNum, M),
             debug(1,"(storage_join) spawning and registering ~p~n",
                 [BackupName]),
@@ -277,197 +279,127 @@ storage_await_maps(MyNum, Map, BackupMap, M) ->
                     storage_await_maps(MyNum, Map, NewBackupMap, M);
                 _ ->
                     NodeName = storage_get_expected_node_name_of(MyNum),
-                    global:send(NodeName, {serving, MyNum}),
-                    print("(await_maps) Sent {serving, ~p} to ~p~n",
-                        [MyNum, NodeName]),
-                    print("(await_maps) Entering storage_serve(~p, ~p, ~p)~n",
-                        [Map, storage_get_neighbors(MyNum, M), M]),
-                    storage_serve(Map, storage_get_neighbors(MyNum, M), M)
+                    global_send(NodeName, {serving, MyNum}),
+                    storage_serve(Map, MyNum, M)
             end
     end.
 
 %% The main state of a storage process; responds to messages.
+%% MyNum: The identification number of this storage process
 %% Map: A tuple list of {Key, Value}
-%% Neighbors: a list of the process numbers of this process' chord neighbors.
 %% M: Where there are 2^M storage processes.
-storage_serve(Neighbors, M) ->
+storage_serve(MyNum, M) ->
     print("(storage_serve) Entered storage_serve.~n"),
-    storage_serve([], Neighbors, M).
-storage_serve(Map, Neighbors, M) ->
-    MyNum = get_legal_num(hd(Neighbors), -1, 
-        round(math:pow(2,M))),
+    storage_serve([], MyNum, M).
+storage_serve(Map, MyNum, M) ->
     debug(1, "(storage_serve) Waiting for messages.~n"
         ++"\tMy map:~p.~n\tGlobal names:~p~n",
         [Map, global:registered_names()]),
     receive
+    Message ->
+        print("(storage_serve) Got ~p.~n", [Message]),
+        case Message of
 
     %%%%%% Outside world messages %%%%%%
+        %%%%%%% Key storage/retrieval %%%%%%%%
         {Pid, Ref, store, Key, Value} ->
-            print("(storage_serve) Got {~p, ~p, ~p, ~p, ~p}~n", 
-                [Pid, Ref, store, Key, Value]),
             ProcNum = hash(Key, M),
-            print("(storage_serve ~p) ~p key goes on ~p. I'll...", 
+            debug(1, "(storage_serve ~p) ~p key goes on ~p. I'll...~n", 
                 [MyNum, Key, ProcNum]),
             case ProcNum of
                 MyNum ->
-                    io:format("Reply to it!~n"),
+                    debug(1, "Reply to it!~n"),
                     OldValue =
                     case lists:keyfind(Key, 1, Map) of
-                        {_, _} ->
-                            ok;
-                        false ->
-                            no_value
+                        {Key, Val} -> Val;
+                        false -> no_value
                     end,
                     NewMap = lists:keystore(Key, 1, Map, {Key, Value}),
-                    global:send(backup_name(MyNum), {self(), Ref, 
+                    global_send(backup_name(MyNum), {self(), Ref, 
                             write_backup, Key, Value}),
-                    print("(storage_serve) Sent {~p, ~p, ~p, ~p, ~p} to ~p~n",
-                        [self(), Ref, write_backup, Key, Value, 
-                            backup_name(MyNum)]),
                     receive
                         {bACKup, Ref} ->
                             print("(storage_serve) Got {~p, ~p}~n", [bACKup, 
                                     Ref])
                     end,
                     Pid ! {Ref, stored, OldValue},
-                    print("(storage_serve) Sent {~p, ~p, ~p}~n", [Ref, 
-                            stored, OldValue]),
-                    storage_serve(NewMap, Neighbors, M);
+                    print("(storage_serve) Sent {~p, ~p, ~p}~n",
+                        [Ref, stored, OldValue]),
+                    storage_serve(NewMap, MyNum, M);
                 Other ->
-                    Forward = storage_get_forwarding_neighbor(Other, 
-                        storage_get_neighbors(
-                            MyNum, M)),
-                    io:format("Forward it to ~p!~n", [Forward]),
-                    global:send(storage_name(Forward) , {Pid, Ref, store, 
+                    Forward = storage_get_forwarding_neighbor(Other, MyNum, M),
+                    debug(1,"Forward it to ~p!~n", [Forward]),
+                    global_send(storage_name(Forward) , {Pid, Ref, store, 
                             Key, Value}),
-                    print("(storage_serve) Sent {~p, ~p, ~p, ~p, ~p}~n", 
-                        [Pid, Ref, store, Key, Value]),
-                    storage_serve(Map, Neighbors, M)
+                    storage_serve(Map, MyNum, M)
             end;
         {Pid, Ref, retrieve, Key} ->
-            print("(storage_serve) Got {~p, ~p, ~p, ~p}~n", [Pid, Ref, 
-                    retrieve, Key]),
             ProcNum = hash(Key, M),
             case ProcNum of
                 MyNum ->
                     Value = case lists:keyfind(Key, 1, Map) of
-                        {Key, Val} ->
-                            Val;
-                        false ->
-                            no_value
+                        {Key, Val} -> Val;
+                        false -> no_value
                     end,
                     Pid ! {Ref, retrieved, Value},
                     print("(storage_serve) Sent {~p, ~p, ~p}~n", [Ref, 
                             retrieved, Value]);
                 Other ->
-                    Forward = storage_get_forwarding_neighbor(Other, 
-                        storage_get_neighbors(
-                            MyNum, M)),
-                    global:send(storage_name(Forward), 
-                        {Pid, Ref, retrieve, Key}),
-                    print("(storage_serve) Sent {~p, ~p, ~p, ~p}~n", [Pid, 
-                            Ref, retrieve, Key])
+                    Forward = storage_get_forwarding_neighbor(Other, MyNum, M),
+                    global_send(storage_name(Forward), 
+                        {Pid, Ref, retrieve, Key})
             end,
-            storage_serve(Map, Neighbors, M);
+            storage_serve(Map, MyNum, M);
+
+        %%%%%%% Snapshot-like requests %%%%%%%%
         {Pid, Ref, first_key} ->
-            print("(storage_serve) Got {~p, ~p, ~p}~n", [Pid, Ref, 
-                    first_key]),
-            KeyList = lists:map(fun(X) ->
-                        element(1, X) end, Map),
-            First = lists:min(KeyList),
-            storage_get_requested_info(Map, Neighbors,
-                Pid, Ref, first_key, MyNum, First),
-            storage_serve(Map, Neighbors, M);
-        {Pid, Ref, first_key, Starter, First} ->
-            print("(storage_serve) Got {~p, ~p, ~p, ~p, ~p}~n",
-                [Pid, Ref, first_key, Starter, First]),
-            case Starter of
-                MyNum ->
-                    Pid ! {Ref, result, First},
-                    print("(storage_serve) Sent {~p, ~p, ~p}~n", [Ref, 
-                            result, First]);
-                _ ->
-                    storage_get_requested_info(
-                        Map, Neighbors, Pid, Ref, first_key, Starter, First)
-            end,
-            storage_serve(Map, Neighbors, M);
+            KeyList = lists:map(fun(X) -> element(1, X) end, Map),
+            storage_get_requested_info(MyNum, Map, 
+                {Pid, Ref, first_key, MyNum, lists:min(KeyList)}),
+            storage_serve(Map, MyNum, M);
         {Pid, Ref, last_key} ->
-            print("(storage_serve) Got {~p, ~p, ~p}~n", [Pid, Ref, 
-                    last_key]),
-            KeyList = lists:map(fun(X) ->
-                        element(1, X) end, Map),
-            Last = lists:max(KeyList),
-            storage_get_requested_info(Map, Neighbors,
-                Pid, Ref, last_key, MyNum, Last),
-            storage_serve(Map, Neighbors, M);
-        {Pid, Ref, last_key, Starter, Last} ->
-            print("(storage_serve) Got {~p, ~p, ~p, ~p, ~p}~n",
-                [Pid, Ref, last_key, Starter, Last]),
-            case Starter of
-                MyNum ->
-                    Pid ! {Ref, result, Last},
-                    print("(storage_serve) Sent {~p, ~p, ~p}~n", [Ref, 
-                            result, Last]);
-                _     ->
-                    storage_get_requested_info(
-                        Map, Neighbors, Pid, Ref, last_key, Starter,Last)
-            end,
-            storage_serve(Map, Neighbors, M);
+            KeyList = lists:map(fun(X) -> element(1, X) end, Map),
+            storage_get_requested_info(MyNum, Map, 
+                {Pid, Ref, last_key, MyNum, lists:max(KeyList)}),
+            storage_serve(Map, MyNum, M);
         {Pid, Ref, num_keys} ->
-            print("(storage_serve) Got {~p, ~p, ~p}~n", [Pid, Ref, 
-                    num_keys]),
-            storage_get_requested_info(Map, Neighbors,
-                Pid, Ref, num_keys, MyNum, 0),
-            storage_serve(Map, Neighbors, M);
-        {Pid, Ref, num_keys, Starter, Total} ->
-            print("(storage_serve) Got {~p, ~p, ~p, ~p, ~p}~n", [Pid, Ref, 
-                    num_keys, Starter, Total]),
-            case Starter of
-                MyNum ->
-                    Pid ! {Ref, result, Total},
-                    print("(storage_serve) Sent {~p, ~p, ~p}~n", [Ref, 
-                            result, Total]);
-                _ ->
-                    storage_get_requested_info(
-                        Map, Neighbors,
-                        Pid, Ref, num_keys, Starter, Total)
-            end,
-            storage_serve(Map, Neighbors, M);
+            storage_get_requested_info(MyNum, Map,
+                {Pid, Ref, num_keys, MyNum, 0}),
+            storage_serve(Map, MyNum, M);
+        {Pid, Ref, Atom, Starter, Running} ->
+            storage_get_requested_info(MyNum, Map,
+                        {Pid, Ref, Atom, Starter, Running}),
+            storage_serve(Map, MyNum, M);
+
+        %%%%%%%% Forward to my node process %%%%%%
         {Pid, Ref, node_list} ->
-            print("(storage_serve) Got {~p, ~p, ~p}~n", [Pid, Ref, 
-                    node_list]),
             MyNode = storage_get_expected_node_name_of(MyNum),
             Message = {Pid, Ref, node_list, []},
-            global:send(MyNode, Message),
-            storage_serve(Map, Neighbors, M);
+            global_send(MyNode, Message),
+            storage_serve(Map, MyNum, M);
         {Pid, Ref, leave} ->
-            print("(storage_serve) Got {~p, ~p, ~p}~n", 
-                [Pid, Ref, leave]),
             %% Tell my node to leave.
-            global:send(storage_get_expected_node_name_of(MyNum), 
+            global_send(storage_get_expected_node_name_of(MyNum), 
                 {Pid, Ref, leave}),
-            storage_serve(Map, Neighbors, M);
+            storage_serve(Map, MyNum, M);
 
     %%%%%%%% Internal messages
         {Pid, request_backup} ->
             %% Someone is trying to restore my backup copy.
             Pid ! {backup, Map},
-            storage_serve(Map, Neighbors, M);
+            print("sent {backup, ~p} to ~p~n", [Map, Pid]),
+            storage_serve(Map, MyNum, M);
         {SwitcherPid, switch} ->
-            print("(storage_serve) Got {~p, switch}~n", 
-                [SwitcherPid]),
             NewName = backup_name(MyNum),
             glocally_unregister_name(storage_name(MyNum)),
-            glocally_register_name((NewName), self()),
+            glocally_register_name(NewName, self()),
             SwitcherPid ! {switched, MyNum},
-            print("Sent {switched, ~p} to ~p~n",
-                [MyNum, SwitcherPid]),
+            print("Sent {switched, ~p} to ~p~n", [MyNum, SwitcherPid]),
             backup(MyNum, Map, M);
-        Message ->
-            print("(storage_serve) Got unexpected Message: ~p~n",
-                [Message]),
-            storage_serve(Map, Neighbors, M)
-    end.
+        _ ->
+            storage_serve(Map, MyNum, M)
+    end
+end.
 
 %% ===========================================================================
 %% Backup Process States
@@ -497,7 +429,7 @@ backup(MyNum, Map, M) ->
             print("(backup) Sent {switched, ~p} to ~p~n", 
                 [MyNum, SwitcherPid]),
             print("(backup) Entering (storage_serve)~n"),
-            storage_serve(Map, storage_get_neighbors(MyNum, M), M);
+            storage_serve(Map, MyNum, M);
         Message ->
             print("(backup) Got unexpected Message: ~p~n",[Message]),
             backup(MyNum, Map, M)
@@ -512,47 +444,57 @@ backup(MyNum, Map, M) ->
 
 hash(Key, M) ->
     debug(1,"Hashing key ~p~n", [Key]),
-    erlang:phash(Key, round(math:pow(2,M)))-1.           
+    erlang:phash(Key, trunc(math:pow(2,M)))-1.           
 
 
 %% Messaging-Related 
 %% Functions 
 %% ---------------------------------------------------------------------------
 
+%% Send Message to the process with number 1 higher (mod 2^M) than SenderNum.
+%% This is legal because the next process num is always a neighbor.
+storage_send_to_next_process(SenderNum, Message) ->
+    StorNums = lists:sort(lists:filter(fun(X) -> is_node(X) end, 
+            global:registered_names())),
+    Name = storage_name(get_next_num(SenderNum, StorNums)),
+    global_send(Name, Message).
+
 %% Given my node name, an intended node recipient (both node nums), and a 
 %% Message, send the message on an acceptable legal path to the recipient.
-node_send_to_node_proc(Sender, RecipientNum, Message, M) ->
-    NumProcesses = round(math:pow(2,M)),
+node_send_to_node_proc(SenderNum, RecipientNum, Message, M) ->
     debug(1,"(send_to_node) Routing message from nodes ~p to ~p:~n\t~p~n", 
-        [Sender, RecipientNum, Message]),
-    SenderSucNum = node_get_successor(Sender),
-    LastStorageNum = get_legal_num(node_get_num(SenderSucNum), 
-        					(-1),
-						NumProcesses),
-    debug(3,"(send_to_node) Sender's Successor: ~p. LastStorageNum: ~p.~n",
-        [SenderSucNum, LastStorageNum]),
-    Neighbors = storage_get_neighbors(LastStorageNum, M),
-    ForwardingNeighbor = storage_get_forwarding_neighbor(RecipientNum, 
-        Neighbors),
-    debug(3,"(send_to_node) ForwardingNeighbor(~p, ~p) is ~p~n",
-        [RecipientNum, Neighbors, ForwardingNeighbor]),
-    NeighborNode = storage_get_expected_node_name_of(ForwardingNeighbor),
-    debug(2, "(send_to_node) Got forwarding neighbor: ~p on ~p~n", 
-        [ForwardingNeighbor, NeighborNode]),
-    global:send(NeighborNode, Message),
-    print("(send_to_node) Sent ~p to ~p~n", [Message, NeighborNode]).
+        [SenderNum, RecipientNum, Message]),
+    NumProcesses = trunc(math:pow(2,M)),
+    %% New plan: Take the difference mod 2, forward to that node.
+    Diff = abs(RecipientNum - SenderNum),
+    Rem = Diff rem NumProcesses,
+    debug(1, "Diff:~p. Rem:~p.~n", [Diff, Rem]),
+    Ten = math:log(Rem),
+    Raw = Ten / math:log(2),
+    Steps = trunc(Ten / math:log(2)) + 1,
+    debug(1,"Ten:~p, Raw:~p, Steps: ~p~n", [Ten, Raw, Steps]),
+    TargetProc = (Steps + SenderNum) rem NumProcesses,
+    Target = storage_get_expected_node_name_of(TargetProc),
+    debug(1,"TargetProc:~p Target:~p case? ~p~n", 
+        [TargetProc, node_get_num(Target), node_get_num(Target) == SenderNum]),
+    case node_get_num(Target) == SenderNum of
+        true -> node_send_to_node_proc(TargetProc, RecipientNum, Message, M);
+        false -> global_send(Target, Message)
+    end.
 
 %% Given an intended recipient number and a list of neighbor numbers, which
 %% neighbor should I send to?
-storage_get_forwarding_neighbor(RecipientNum, Neighbors)->
-    debug(3,"Entering storage_get_forwarding_neighbor(~p, ~p)~n",
-        [RecipientNum, Neighbors]),
+storage_get_forwarding_neighbor(RecipientNum, SenderNum, M)->
+    Neighbors = [SenderNum | storage_get_neighbors(SenderNum, M)],
+    debug(3,"Entering storage_get_forwarding_neighbor(~p, ~p, ~p)~n",
+        [RecipientNum, SenderNum, Neighbors]),
     Neighbor = case lists:any(fun(Y) -> Y == RecipientNum end, Neighbors) of
         true ->
             RecipientNum; % If we can send directly to RecipientNum...
         false ->
             % Otherwise, find the closest neighbor to RecipientNum.
-            Lower = lists:filter(fun(X) -> X < RecipientNum end, Neighbors),
+            Lower = lists:sort(lists:filter(fun(X) -> X < RecipientNum end, 
+                    Neighbors)),
             case Lower of
                 [] -> lists:last(Neighbors);
                 _-> hd(Lower)
@@ -566,7 +508,7 @@ storage_get_forwarding_neighbor(RecipientNum, Neighbors)->
 %% ---------------------------------------------------------------------------
 
 node_handle_join(Pid, MyNum, MySuccNum, M, ItsPredNum, ItsNum, ItsSuccNum) ->
-    NumProcesses = round(math:pow(2,M)),
+    NumProcesses = trunc(math:pow(2,M)),
     debug(1, "(node_handle_join) Entering "
             ++ "node_handle_join(~p, ~p, ~p, ~p, ~p, ~p, ~p)~n",
         [Pid, MyNum, MySuccNum, M, ItsPredNum, ItsNum, ItsSuccNum]),
@@ -664,8 +606,7 @@ node_spawn_and_register_processes(storage_serve, [P |
     glocally_register_name(BackupName, spawn(key_value_node, 
             backup, [backup_get_num(BackupName), [], M])),
     glocally_register_name(Name, spawn(key_value_node, 
-            storage_serve, [storage_get_neighbors(P, M), 
-                M])),
+            storage_serve, [P, M])),
     debug(4, "Registered ~p and ~p. Registered_names:~p~n", 
         [Name, BackupName, global:registered_names()]),
     node_spawn_and_register_processes(storage_serve, Range, M).
@@ -701,11 +642,8 @@ node_take_responsibility(MyNum, Range, M) ->
 
 
 %% This should kill all the storage processes with numbers in 
-%% range, as well
-%% as their non-global counterparts which backup their 
-%% opposites
-%% Note: It is only possible to kill processes on your own 
-%% node.
+%% range, as well as their counterparts which backup their opposites.
+%% Note: It is only possible to kill processes on your own node.
 node_kill_processes(PrimaryRange, M) ->
     debug(3,"(node_handle_join) Entering node_kill_processes(~p, ~p)~n", 
         [PrimaryRange, M]),
@@ -763,10 +701,10 @@ node_pick_num(NumProcesses)->
 
 %% Returns a list of the numbers of a node's neighbors.
 storage_get_neighbors(MyNum, M)->
-    NumProcesses = round(math:pow(2, M)),
-    [MyNum | lists:map(
-        fun(X) -> get_legal_num(MyNum, round(math:pow(2, X)), NumProcesses) end,
-        lists:seq(0, M-1))].
+    NumProcesses = trunc(math:pow(2, M)),
+    lists:map(
+        fun(X) -> get_legal_num(MyNum, trunc(math:pow(2, X)), NumProcesses) end,
+        lists:seq(0, M-1)).
 %%
 %% Rebalancing-Related Functions
 %% ---------------------------------------------------------------------------
@@ -821,18 +759,26 @@ glocally_unregister_name(Atom) ->
     unregister(Atom),
     global:unregister_name(Atom).
 
+global_send(Recipient, Message) ->
+    global:send(Recipient, Message),
+    print("Sent ~p to ~p~n", [Message, Recipient]).
+
 node_get_successor(MyNum) ->
     debug(3,"Entering node_get_successor(~p)~n", [MyNum]),
-    NodeNames = 
-        lists:sort(lists:filter(fun(X) -> is_node(X) end, 
-                global:registered_names())),
+    NodeNums = 
+    lists:sort(lists:map(fun(Y) -> node_get_num(Y) end, 
+            lists:filter(fun(X) -> is_node(X) end, 
+                global:registered_names()))),
     % We assume registered_names() is in alphabetical order
-    HigherNodeNames = 
-        lists:sort(lists:filter(fun(Y) -> node_get_num(Y) > MyNum end, 
-                NodeNames)),
-    case HigherNodeNames of
-        [] -> hd(NodeNames);
-        _ -> hd(HigherNodeNames)
+    node_name(get_next_num(MyNum, NodeNums)).
+
+get_next_num(MyNum, NumList) ->
+    HigherNums = 
+        lists:sort(lists:filter(fun(Y) -> Y > MyNum end, 
+                NumList)),
+    case HigherNums of
+        [] -> hd(NumList);
+        _ -> hd(HigherNums)
     end.
 
 node_get_predecessor(MyNum) ->
@@ -867,13 +813,6 @@ node_get_num(Atom) ->
     debug(4,"Entering node_get_num(~p)~n", [Atom]),
     node_get_num(atom_to_list(Atom)).
 
-storage_get_num([P | Name])->
-    debug(4,"Entering storage_get_num"),
-    list_to_integer(lists:sublist([P | Name], 15, length([P | Name])));
-storage_get_num(Atom) ->
-    debug(4,"Entering storage_get_num"),
-    storage_get_num(atom_to_list(Atom)).
-
 backup_get_num([P | Name])->
     list_to_integer(lists:sublist([P | Name], 7, length([P | Name])));
 backup_get_num(Atom) ->
@@ -884,8 +823,8 @@ backup_get_num(Atom) ->
 %% processes,
 %% return the correct process number.
 get_legal_num(Start, Offset, NumProcesses)->
-    Ret = (Start+round(Offset)+round(NumProcesses)) rem 
-    round(NumProcesses),
+    Ret = (Start+trunc(Offset)+trunc(NumProcesses)) rem 
+    trunc(NumProcesses),
     debug(4, "get_legal_num(~p, ~p, ~p) returning ~p~n",
         [Start, Offset, NumProcesses, Ret]),
     Ret.
@@ -896,6 +835,7 @@ all_node_procs() ->
 %% Given a process number, get the name of the node process it's supposed to be 
 %% on
 storage_get_expected_node_name_of(MyNum) ->
+    global:sync(),
     NodeNames = lists:sort(lists:filter(fun(Y) ->
                     is_node(Y) 
             end, global:registered_names())),
@@ -916,7 +856,7 @@ storage_get_expected_node_name_of(MyNum) ->
 storage_assoc_backup_name(MyNum, M) ->
     debug(4,"entered storage_assoc_backup_name(~p,~p)~n",[MyNum, M]),
     BackupNum = 
-        get_legal_num(MyNum, round(math:pow(2, M-1)), round(math:pow(2, M))),
+        get_legal_num(MyNum, trunc(math:pow(2, M-1)), trunc(math:pow(2, M))),
     backup_name(BackupNum).
 
 %% We assume that all nodes register a global process named 
@@ -940,35 +880,35 @@ is_backup(Atom) ->
     debug(4,"is it a backup process? ~p~n", [Atom]),
     [hd(atom_to_list(Atom))] == "B".
 
-%% Forward "snapshot" infor requests around ring & aggregate 
+%% Forward "snapshot" infor requests atrunc ring & aggregate 
 %% information
-storage_get_requested_info(Map, Neighbors, Pid, Ref, Atom, Starter, Running)->
+storage_get_requested_info(MyNum, MyMap, {Pid, Ref, Atom, Starter, Running})->
     debug(1,"Entering storage_get_requested_info"),
-    FirstNeighbor = storage_name(hd(Neighbors)),
-    Message = 
-    case Atom of
-        first_key ->
-            KeyList = lists:map(fun(X) ->
-                        element(1, X) end, 
-                Map),
-            NewFirst = lists:min([Running | KeyList]),
-            {Pid, Ref, first_key, Starter, NewFirst};
-        last_key ->
-            KeyList = lists:map(fun(X) ->
-                        element(1, X) end, 
-                Map),
-            NewLast = lists:max([Running | KeyList]),
-            {Pid, Ref, last_key, Starter, NewLast};
-        num_keys ->
-            NewTotal = Running + length(Map),
-            {Pid, Ref, num_keys, Starter, NewTotal}
-    end,
-    global:send(FirstNeighbor, Message),
-    %% TODO: Is this a debugging thing to get rid of before we submit?
-    case Message of
-        {P, R, Atom, S, Agg} ->
-            print("(storage_serve) Sent {~p, ~p, ~p, ~p, ~p} ~n",
-                [P, R, Atom, S, Agg])
+    case Starter of
+        MyNum ->
+            Pid ! {Ref, result, Running},
+            print("(storage_serve) Sent {~p, ~p, ~p} to ~p~n",
+                [Ref, result, Running, Pid]);
+        _ ->
+            Message = 
+            case Atom of
+                first_key ->
+                    KeyList = lists:map(fun(X) ->
+                                element(1, X) end, 
+                        MyMap),
+                    NewFirst = lists:min([Running | KeyList]),
+                    {Pid, Ref, first_key, Starter, NewFirst};
+                last_key ->
+                    KeyList = lists:map(fun(X) ->
+                                element(1, X) end, 
+                        MyMap),
+                    NewLast = lists:max([Running | KeyList]),
+                    {Pid, Ref, last_key, Starter, NewLast};
+                num_keys ->
+                    NewTotal = Running + length(MyMap),
+                    {Pid, Ref, num_keys, Starter, NewTotal}
+            end,
+            storage_send_to_next_process(MyNum, Message)
     end.
 
 node_get_my_processes() ->
@@ -1001,7 +941,7 @@ proc_node_prefix() ->
                 {registered_name, Atom} -> atom_to_list(Atom);
                 _ -> pid_to_list(self())
             end,
-            io_lib:format(" ~-10s:~15s: ", [atom_to_list(node()), Pname]).
+            io_lib:format(" ~-10s:~18s: ", [atom_to_list(node()), Pname]).
 %% Prints String to console with timestamp prefix and format 
 %% Data.
 print(String) -> print(String, []).
