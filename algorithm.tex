@@ -83,12 +83,12 @@ In the rebalancing state, a node process will:
 \item If it can take all of its successor's processes safely, it will. Then it will change to Monitoring again.
 \item If it cannot take all processes and still have half the processes or less, it:
 \begin{enumerate}
-\item Determines which of the deceased processes it already has the backups for(guaranteed if the new processes would push it over half of the total)
-\item ``switches" those backup processes to storage process, and their backups to storage processes. This is effectively removing the processes it doesn't have room for, while maintaining backups that its predecessor can ask for. The ``switch" is done through sending a message to the appropriate processes and collecting all responses.
-\item Spawns and initializes the remainder of the processes from the deceased node(Those whose backups are elsewhere)
+\item Determines which of the deceased processes it already has the backups for (guaranteed if the new processes would push it over half of the total)
+\item ``switches" those backup processes to storage process, and their backups to storage processes. This is effectively removing the processes it doesn't have room for, while maintaining backups that its predecessor can ask for. The ``switch" is done through sending a message to the appropriate processes and collecting all responses before proceeding.
 \item Unregisters itself and re-registers itself with the Node ID that corresponds to its calculated new set of storage processes.
 \item Routes a message to its predecessor node, telling it to transition to Overflow and sending it the numbers of the processes it must take (whichever are necessary for the successor node to have exactly half of the storage processes in the cluster--this is the same set of its own processes that it ``switched'').
 \item Waits to receive an acknowledgement from the predecessor indicating that it has completed the Overflow state.
+\item Spawns and initializes the remainder of the processes from the deceased node (Those whose backups are elsewhere)
 \end{enumerate}
 \item It then re-enters the monitoring state.
 \end{enumerate}
@@ -113,9 +113,6 @@ Procedure for a process ID $P$ responsible for map $P$ and backup $B$, where $B 
 \item Once we've gotten both maps, alert $P$'s host node's process with a {\tt serving} message and transition to start serving.
 \end{enumerate}
 \end{enumerate}
-%Note: Nodes will now have to wait to receive callbacks from both the primary and the backup before rebalance is completed.
-
-%Note: As currently implemented, we call back imediately after spawning the backup. We think this will not cause problems, but if hypothetically it's possible for the backup to not be done spawning, it might cause problems.
 
 \subsubsection{Servicing Requests}
 
@@ -156,13 +153,13 @@ Messages that may be received by each sort of process
 \item\{${\tt take\_processes}, Recipient, Range$\} A message forwarded around the ring until it reaches the predecessor of the node that sent it. A recipient of this message will take responsibility for the storage processes whose numbers are listed in Range. It is assumed that by the time this message is sent,
 1) The processes in Range now have no globally registered versions, so the recipient node is free to register them
 2) The recipient node can request the maps of the Range nodes from its backups, which are fully functional by now.
+\item\{{\tt monitoring}\} Sent by a node that has finished taking processes as instructed by a {\tt take\_process} message to the node that prompted it (which is now its successor) to indicate that it has finished taking over the processes and re-entered the monitoring state. The rebalancing process blocks while waiting for this, as described above.
 \item\{${\tt join\_request}, Pid$\} Sent by an unnamed, uninitialized new node process. This causes the receiving node to forward a more informative version around the circle until it reaches the appropriate node.
 \item\{${\tt join\_request}, Pid, ItsPredNum, ItsNum, ItsSuccNum$\}: Internal message sent by the nodes until it reaches the node that will be the predecessor of the joining node, at which point its predecessor sends it all the appropriate information in a {\tt join\_ack}.
 \item\{${\tt join\_ack}, Num, SucessorNum, Range$\} The message received by a joining node when its request has reached the appropriate node.
 \item\{$Pid, Ref, {\tt leave}$\}When a node process is told to leave, it calls {\tt node\_leave}, which kills the erlang node.
 \item\{$Pid, Ref, {\tt node\_list}, Starter, AggregateList$\} Initially sent to a node process from the storage process that received it, this message is passed around the nodes, and once every node has added its name to $AggregateList$ the $Starter$ node sends the list back to $Pid$.
-\item\{$Ref, {\tt result}, NodeList$\} Send by a {\tt monitoring} node process to the $Pid$ specified in the {\tt node\_list} request. Contains the current list of nodes, barring failures since the request was sent.
-%\item\{${\tt }$\}
+\item\{$Ref, {\tt result}, NodeList$\} Sent by a {\tt monitoring} node process to the $Pid$ specified in the {\tt node\_list} request. Contains the current list of nodes, barring failures since the request was sent.
 \end{itemize}
 
 \subsubsection{Storage Process Messages}
@@ -170,12 +167,12 @@ Messages that may be received by each sort of process
 A storage process may receive the following messages. Messages that can only be recieved in a specific state are specified.
 
 \begin{itemize}
-\item\{$Pid, Ref, {\tt store}, Key, Value$\} Sent to a {\tt serving} storage process by the outside world or another {\tt serving} storage process. The storage process will then hash the key to a specific storage process, and forward the message as-is to the best neighbor to get it to that process as per section \ref{message passing}. If it is the right process, it will incorporate the included /{$Key, Value$/} pair into its map and respond to the message with the following:
+	\item\{$Pid, Ref, {\tt store}, Key, Value$\} Sent to a {\tt serving} storage process by the outside world or another {\tt serving} storage process. The storage process will then hash the key to a specific storage process, and forward the message as-is to the best neighbor to get it to that process as per section \ref{message passing}. If it is the right process, it will incorporate the included /{$Key, Value$/} pair into its map. It will send \{$Pid, Ref, {\tt write\_backup}, Key, Value$\} and wait to receive an acknowledgement that the change has been committed before respond to $Pid$ with the following:
 \item\{$Ref, {\tt stored}, OldValue$\} Sent by a {\tt serving} storage process to the $Pid$ included in the {\tt store} request, this message includes the value that was overwritten by the new store. If no value was overwritten, OldValue is{\tt no\_value}.
 \item\{$Pid, Ref, {\tt retrieve, Key}$\} Sent to a {\tt serving} storage process by the outside world or another {\tt serving} storage process. The procedure repeats as outlined above if the recipient process is not the process that the $Key$ hashes to. Otherwise, it will retrieve the associated $Value$ from its map and respond directly to the $Pid$ in the message with the following:
-\item\{Ref, {tt retrieved}, Value\} Sent by a {\tt serving} storage process to the $Pid$ included in the {\tt retrieve} request, this message includes the value that was retrieved.
+\item\{$Ref, {\tt retrieved}, Value$\} Sent by a {\tt serving} storage process to the $Pid$ included in the {\tt retrieve} request, this message includes the value that was retrieved.
 \item\{$Pid, Ref, {\tt first\_key}$\} Sent to a {\tt serving} storage process by the outside world. The storage process will then send the more verbose version below through the ring, starting by sending its own alphabetically first key to its first neighbor.
-\item\{$Pid, Ref, {\tt first\_key, Starter, First}$\} Sent to a {\tt serving} storage process by another {\tt serving} process to find the alphabetically first key. If the receiving process finds that $Starter$ is its own process number, it knows the request has gone all the way around the ring, and it sends a response to the $Pid$. Otherwise, it replaces the $First$ key with its own first key if applicable, and forwards the message to its first neighbor.
+\item\{$Pid, Ref, {\tt first\_key}, Starter, First$\} Sent to a {\tt serving} storage process by another {\tt serving} process to find the alphabetically first key. If the receiving process finds that $Starter$ is its own process number, it knows the request has gone all the way around the ring, and it sends a response to the $Pid$. Otherwise, it replaces the $First$ key with its own first key if applicable, and forwards the message to its first neighbor.
 \item\{$Pid, Ref, {\tt last\_key}$\} Sent to a {\tt serving} storage process by the outside world. The storage process will then send the more verbose version below through the ring, starting by sending its own alphabetically last key to its first neighbor.
 \item\{$Pid, Ref, {\tt last\_key, Starter, Last}$\} Sent to a {\tt serving} storage process by another {\tt serving} process to find the alphabetically last key. If the receiving process finds that $Last$ is its own process number, it knows the request has gone all the way around the ring, and it sends a response to the $Pid$. Otherwise, it replaces the $Last$ key with its own last key if applicable, and forwards the message to its first neighbor.
 \item\{$Pid, Ref, {\tt num\_keys}$\} Sent to a {\tt serving} storage process by the outside world. The storage process will then send the more verbose version below through the ring, starting by sending its total number of keys to its first neighbor.
@@ -194,6 +191,7 @@ A storage process may receive the following messages. Messages that can only be 
 \item\{$Pid, {\tt request\_map}$\} Sent to a backup process by a {\tt joining} storage process. The backup process will respond by sending its map back to the $Pid$ in the request.
 \item\{${\tt map}, Map$\} Sent by a backup process to the $Pid$ included in the original request.
 \item\{$Pid, {\tt switch}$\} Sent to a backup process by its parent node, telling the backup process that it needs to become a storage process, because its parent node is taking over the storage process it backs up, and giving up the backup version. Its parent's predecessor is therefore going to need to be able to spawn a new backup from the storage process it will become.
+\item\{${\tt bACKup}, Ref$\} Sent by a backup process in response to {\tt write\_backup} after the backup process incorporates the change into its map. $Ref$ is the unique identifier that came with the store request.
 \end{itemize}
 
 \section{Correctness Argument}
@@ -237,15 +235,8 @@ This rebalancing method guarantees that our invariants are maintained in {\tt mo
 All requests for system information are processed in the same way--the first process sends an internal, more descriptive version of the request in order around the ring, aggregating the necessary information. Barring crashes which interfere with message passing, the first process eventually receives the message back and is able to reply. We use this method for the {\tt node\_list} as well, but we pass the message through node processes, not storage processes.
 
 \subsection{Message Passing}
+In general, we pass a message as far as we can without passing the recipient. Due to the chord system, we pass any message at least halfway to its recipient with each hop. Specifically, if Node $A$ wants to send a message to Node $B$, {\tt node\_send\_to\_node\_proc} computes Steps, the logarithm base two of the distance modulo $2^{M}$ between them, rounded down. It then determines the node to which storage process $A + Steps$ belongs. If $A + Steps$ is also on Node $A$, the function is called recursively with $A + Steps$ as $A$. If $A + Steps$ is on a node other than $A$, it is guaranteed to be a legal move because of how we calculate Steps, so the node passes the message on to the new target.
 
-Message passing in our algorithm takes a simple approach: In general, we pass a message as far as we can without passing the recipient. Due to the chord system, we pass any message at least halfway to its recipient with each hop. Our particular implementation of node and storage process message passing is detailed in section \ref{message passing}.\\
-
-%\listoftodos
-
-%\todo[inline]{make sure to account for when second to last node dies.}
-%\todo[inline]{ Make the test program verify that keys are being stored on the correct node}
-%\todo[inline]{Spellcheck!}
-
-
+Storage processes only pass messages to their successors or to their backups. Both of these are legal: Their successor is their first neighbor, and we have defined backups to always be located on the same node as their last neighbor.
 \end{document}
 
